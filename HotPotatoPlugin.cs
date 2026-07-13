@@ -100,6 +100,32 @@ public class HotPotatoConfig : BasePluginConfig
     // (useful if beams misbehave on a map).
     [JsonPropertyName("SafeZoneBeamSegments")]
     public int SafeZoneBeamSegments { get; set; } = 24;
+
+    // Server commands executed when a match starts. Defaults end warmup,
+    // disable respawns, and prevent rounds ending mid-game. Adjust these
+    // if your server doesn't run an infinite-warmup setup.
+    [JsonPropertyName("OnStartCommands")]
+    public List<string> OnStartCommands { get; set; } = new()
+    {
+        "mp_warmup_end",
+        "mp_respawn_on_death_ct 0",
+        "mp_respawn_on_death_t 0",
+        "mp_ignore_round_win_conditions 1",
+        "mp_roundtime 60",
+        "mp_freezetime 0"
+    };
+
+    // Server commands executed when a match stops or finishes. Defaults
+    // restore normal respawns and round conditions. If you run an
+    // infinite-warmup practice server, add mp_warmuptime / mp_warmup_pausetimer /
+    // mp_warmup_start here to drop back into it; otherwise leave those out.
+    [JsonPropertyName("OnStopCommands")]
+    public List<string> OnStopCommands { get; set; } = new()
+    {
+        "mp_respawn_on_death_ct 1",
+        "mp_respawn_on_death_t 1",
+        "mp_ignore_round_win_conditions 0"
+    };
 }
 
 [MinimumApiVersion(80)]
@@ -258,7 +284,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         _matchActive = true;
         _currentRound = 0;
 
-        foreach (var cmd in ConfigOnStartCommands())
+        foreach (var cmd in Config.OnStartCommands)
             Server.ExecuteCommand(cmd);
 
         Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} Match starting: {ChatColors.Green}{Config.RoundsPerMatch}{ChatColors.White} rounds, last survivor wins each round!");
@@ -274,32 +300,12 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         _currentRound = 0;
         _participants.Clear();
 
-        foreach (var cmd in ConfigOnStopCommands())
+        foreach (var cmd in Config.OnStopCommands)
             Server.ExecuteCommand(cmd);
 
         if (announce)
             Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} Match stopped, server restored.");
     }
-
-    private static List<string> ConfigOnStartCommands() => new()
-    {
-        "mp_warmup_end",
-        "mp_respawn_on_death_ct 0",
-        "mp_respawn_on_death_t 0",
-        "mp_ignore_round_win_conditions 1",
-        "mp_roundtime 60",
-        "mp_freezetime 0"
-    };
-
-    private static List<string> ConfigOnStopCommands() => new()
-    {
-        "mp_respawn_on_death_ct 1",
-        "mp_respawn_on_death_t 1",
-        "mp_ignore_round_win_conditions 0",
-        "mp_warmuptime 999999",
-        "mp_warmup_pausetimer 1",
-        "mp_warmup_start"
-    };
 
     // ---------------- Round lifecycle ----------------
 
