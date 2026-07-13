@@ -1,20 +1,20 @@
-# 🥔 HotPotato — CS2 Keep-Away Gamemode
+# 🥔 HotPotato - CS2 Keep-Away Gamemode
 
 A chaotic party gamemode plugin for Counter-Strike 2, built on [CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp).
 
-A "hot potato" is assigned to a random player. The holder gets a speed boost, a golden glow, and shows on everyone's radar — but their health drains every second. Pass it by getting close and pressing **E**, or by knifing someone. If the fuse runs out or the holder dies, they explode. Last survivor wins the round. Most round wins takes the match. A shrinking safe zone keeps everyone moving.
+A "hot potato" is assigned to a random player. The holder gets a speed boost, a golden glow, and shows on everyone's radar, but their health drains every second. Pass it by getting close and pressing **E**, or by knifing someone. If the fuse runs out or the holder dies, they explode. Last survivor wins the round. Most round wins takes the match. A shrinking safe zone keeps everyone moving.
 
 ## Features
 
-- 🏃 **Configurable holder speed boost** — the potato carrier moves faster
-- 💛 **Golden glow visible through walls** + gold model tint + forced radar blip, so the holder can't hide
-- 🔪 **Two pass mechanics** — press E near a player, or land a knife hit (knife passes deal no damage)
-- 💥 **Fuse timer + health drain** — hold too long and you explode
-- 🏆 **Multi-round matches with a scoreboard** — round wins tracked, medals in chat, champion announced
+- 🏃 **Configurable holder speed boost**: the potato carrier moves faster
+- 💛 **Golden glow visible through walls**, plus gold model tint and forced radar blip, so the holder can't hide
+- 🔪 **Two pass mechanics**: press E near a player, or land a knife hit (knife passes deal no damage)
+- 💥 **Fuse timer + health drain**: hold too long and you explode
+- 🏆 **Multi-round matches with a scoreboard**: round wins tracked, medals in chat, champion announced
 - 🌀 **Shrinking safe zone** (battle-royale style) with a visible beam ring and out-of-zone damage
-- 🗺️ **Deathmatch-style spawn spreading** — players scattered across all map spawn points each round
-- 🛡️ **Player-vs-player damage disabled during games** (configurable) — only the potato kills
-- ⚙️ Fully config-driven — every mechanic tunable without recompiling
+- 🗺️ **Deathmatch-style spawn spreading**: players scattered across all map spawn points each round
+- 🛡️ **Player-vs-player damage disabled during games** (configurable), only the potato kills
+- ⚙️ Fully config-driven, every mechanic tunable without recompiling
 
 ## Requirements
 
@@ -81,8 +81,8 @@ Starting a match automatically ends warmup, disables respawns, and prevents roun
 Requires the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 
 ```bash
-git clone https://github.com/YOURNAME/HotPotato.git
-cd HotPotato
+git clone https://github.com/Arsynator/CS2-Hot-Potato-Plugin.git
+cd CS2-Hot-Potato-Plugin
 dotnet build -c Release
 ```
 
@@ -90,7 +90,7 @@ Output: `bin/Release/net8.0/HotPotato.dll`
 
 ## Known limitations
 
-- The safe zone ring draws at a single height (based on spawn-point average), so on multi-level maps (Nuke, Vertigo) the visual may sit at an odd height — the zone *damage* logic is 2D and works correctly regardless.
+- The safe zone ring draws at a single height (based on spawn-point average), so on multi-level maps (Nuke, Vertigo) the visual may sit at an odd height. The zone *damage* logic is 2D and works correctly regardless.
 - Uses the deprecated `CBaseEntity_TakeDamageOldFunc` hook (still functional; migration to `OnEntityTakeDamagePre` planned).
 
 ## License
