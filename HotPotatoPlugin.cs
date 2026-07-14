@@ -101,6 +101,10 @@ public class HotPotatoConfig : BasePluginConfig
     [JsonPropertyName("SafeZoneBeamSegments")]
     public int SafeZoneBeamSegments { get; set; } = 24;
 
+    // Height of the zone "cage" wall (bottom ring, top ring, vertical posts)
+    [JsonPropertyName("SafeZoneWallHeight")]
+    public float SafeZoneWallHeight { get; set; } = 400f;
+
     // Server commands executed when a match starts. Defaults end warmup,
     // disable respawns, and prevent rounds ending mid-game. Adjust these
     // if your server doesn't run an infinite-warmup setup.
@@ -112,7 +116,8 @@ public class HotPotatoConfig : BasePluginConfig
         "mp_respawn_on_death_t 0",
         "mp_ignore_round_win_conditions 1",
         "mp_roundtime 60",
-        "mp_freezetime 0"
+        "mp_freezetime 0",
+        "mp_forcecamera 0"
     };
 
     // Server commands executed when a match stops or finishes. Defaults
@@ -124,7 +129,8 @@ public class HotPotatoConfig : BasePluginConfig
     {
         "mp_respawn_on_death_ct 1",
         "mp_respawn_on_death_t 1",
-        "mp_ignore_round_win_conditions 0"
+        "mp_ignore_round_win_conditions 0",
+        "mp_forcecamera 1"
     };
 }
 
@@ -332,6 +338,17 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
             if (Config.DeathmatchSpawns)
                 SpreadPlayersAcrossSpawns(candidates);
+
+            // Fresh HP for everyone, including last round's survivor
+            foreach (var p in candidates)
+            {
+                var candidatePawn = p.PlayerPawn?.Value;
+                if (candidatePawn != null && candidatePawn.IsValid)
+                {
+                    candidatePawn.Health = 100;
+                    Utilities.SetStateChanged(candidatePawn, "CBaseEntity", "m_iHealth");
+                }
+            }
 
             if (Config.KnivesOnly)
             {
@@ -588,40 +605,47 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         RemoveZoneBeams();
 
         int segments = Config.SafeZoneBeamSegments;
-        float zBase = _zoneCenter.Z + 10f;
+        float zLow = _zoneCenter.Z + 10f;
+        float zHigh = zLow + Config.SafeZoneWallHeight;
 
-        for (int ring = 0; ring < 2; ring++)
+        // Precompute the ring points once
+        var lowPoints = new Vector[segments + 1];
+        var highPoints = new Vector[segments + 1];
+        for (int i = 0; i <= segments; i++)
         {
-            float z = zBase + ring * 60f;
-
-            for (int i = 0; i < segments; i++)
-            {
-                float a1 = (float)(2 * Math.PI * i / segments);
-                float a2 = (float)(2 * Math.PI * (i + 1) / segments);
-
-                var p1 = new Vector(
-                    _zoneCenter.X + _zoneRadius * MathF.Cos(a1),
-                    _zoneCenter.Y + _zoneRadius * MathF.Sin(a1),
-                    z);
-                var p2 = new Vector(
-                    _zoneCenter.X + _zoneRadius * MathF.Cos(a2),
-                    _zoneCenter.Y + _zoneRadius * MathF.Sin(a2),
-                    z);
-
-                var beam = Utilities.CreateEntityByName<CBeam>("beam");
-                if (beam == null) continue;
-
-                beam.Render = Color.FromArgb(255, 255, 60, 60);
-                beam.Width = 3.0f;
-                beam.Teleport(p1, new QAngle(0, 0, 0), new Vector(0, 0, 0));
-                beam.EndPos.X = p2.X;
-                beam.EndPos.Y = p2.Y;
-                beam.EndPos.Z = p2.Z;
-                beam.DispatchSpawn();
-
-                _zoneBeams.Add(beam);
-            }
+            float a = (float)(2 * Math.PI * i / segments);
+            float x = _zoneCenter.X + _zoneRadius * MathF.Cos(a);
+            float y = _zoneCenter.Y + _zoneRadius * MathF.Sin(a);
+            lowPoints[i] = new Vector(x, y, zLow);
+            highPoints[i] = new Vector(x, y, zHigh);
         }
+
+        for (int i = 0; i < segments; i++)
+        {
+            // Bottom ring segment
+            SpawnBeam(lowPoints[i], lowPoints[i + 1]);
+            // Top ring segment
+            SpawnBeam(highPoints[i], highPoints[i + 1]);
+            // Vertical post connecting the rings (the "cage" bars that make
+            // the wall visible from any height)
+            SpawnBeam(lowPoints[i], highPoints[i]);
+        }
+    }
+
+    private void SpawnBeam(Vector start, Vector end)
+    {
+        var beam = Utilities.CreateEntityByName<CBeam>("beam");
+        if (beam == null) return;
+
+        beam.Render = Color.FromArgb(255, 255, 60, 60);
+        beam.Width = 3.0f;
+        beam.Teleport(start, new QAngle(0, 0, 0), new Vector(0, 0, 0));
+        beam.EndPos.X = end.X;
+        beam.EndPos.Y = end.Y;
+        beam.EndPos.Z = end.Z;
+        beam.DispatchSpawn();
+
+        _zoneBeams.Add(beam);
     }
 
     private void RemoveZoneBeams()
