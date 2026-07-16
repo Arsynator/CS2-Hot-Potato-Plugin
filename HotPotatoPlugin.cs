@@ -65,6 +65,9 @@ public class HotPotatoConfig : BasePluginConfig
     [JsonPropertyName("IntermissionSeconds")]
     public float IntermissionSeconds { get; set; } = 6f;
 
+    [JsonPropertyName("FreezeSeconds")]
+    public float FreezeSeconds { get; set; } = 8f;
+
     // Force the holder to be visible on everyone's radar
     [JsonPropertyName("HolderRadarBlip")]
     public bool HolderRadarBlip { get; set; } = true;
@@ -99,7 +102,7 @@ public class HotPotatoConfig : BasePluginConfig
     // Number of beam segments in the visual ring. 0 disables zone visuals
     // (useful if beams misbehave on a map).
     [JsonPropertyName("SafeZoneBeamSegments")]
-    public int SafeZoneBeamSegments { get; set; } = 24;
+    public int SafeZoneBeamSegments { get; set; } = 32;
 
     // Height of the zone "cage" wall (bottom ring, top ring, vertical posts)
     [JsonPropertyName("SafeZoneWallHeight")]
@@ -175,6 +178,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
     private float _fuseRemaining = 0f;
     private float _graceRemaining = 0f;
     private float _lastPassTime = 0f;
+    private float _freezeRemaining = 0f;
     private bool _lastUsePressed = false;
     private bool _bypassDamageBlock = false;
 
@@ -187,8 +191,10 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
     private float _zoneStartRadius = 0f;
     private float _zoneRadius = 0f;
     private float _zoneElapsed = 0f;
+    private float _actualShrinkSeconds = 90f;
     private readonly List<CBeam> _zoneBeams = new();
-    private float _lastBeamUpdate = 0f;
+    private CBaseEntity? _zoneCenterEntity;
+
 
     private CounterStrikeSharp.API.Modules.Timers.Timer? _tickTimer;
 
@@ -293,6 +299,12 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         foreach (var cmd in Config.OnStartCommands)
             Server.ExecuteCommand(cmd);
 
+        Server.ExecuteCommand("mp_roundtime 60");
+        Server.ExecuteCommand("mp_freezetime 0");
+        Server.ExecuteCommand("mp_playerid 2");
+        Server.ExecuteCommand("mp_randomspawn 1");
+        Server.ExecuteCommand("mp_teammates_are_enemies 1");
+
         Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} Match starting: {ChatColors.Green}{Config.RoundsPerMatch}{ChatColors.White} rounds, last survivor wins each round!");
 
         AddTimer(2.0f, StartRound);
@@ -309,6 +321,10 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         foreach (var cmd in Config.OnStopCommands)
             Server.ExecuteCommand(cmd);
 
+        Server.ExecuteCommand("mp_playerid 0");
+        Server.ExecuteCommand("mp_randomspawn 0");
+        Server.ExecuteCommand("mp_teammates_are_enemies 0");
+
         if (announce)
             Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} Match stopped, server restored.");
     }
@@ -321,9 +337,34 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
         _currentRound++;
 
-        // Bring everyone back and spread them out
+        // Reset CS2 HUD round timer to 5 minutes (300 seconds)
+        var proxy = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault();
+        if (proxy != null)
+        {
+            var rules = proxy.GameRules;
+            if (rules != null)
+            {
+                rules.RoundStartTime = (float)Server.CurrentTime;
+                rules.RoundTime = 300;
+                Utilities.SetStateChanged(proxy, "CCSGameRulesProxy", "m_pGameRules");
+            }
+        }
+
+        _roundActive = false;
+        _holder = null;
+        _freezeRemaining = Config.FreezeSeconds;
+
+        // Bring everyone back
         RespawnParticipants();
 
+        // Start freeze countdown timer immediately
+        if (Config.FreezeSeconds > 0)
+        {
+            _tickTimer?.Kill();
+            _tickTimer = AddTimer(1.0f, GameSecondTick, TimerFlags.REPEAT);
+        }
+
+        // Wait for players to spawn, then teleport, heal, and strip them
         AddTimer(1.5f, () =>
         {
             if (!_matchActive) return;
@@ -347,6 +388,9 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
                 {
                     candidatePawn.Health = 100;
                     Utilities.SetStateChanged(candidatePawn, "CBaseEntity", "m_iHealth");
+
+                    if (_freezeRemaining > 0)
+                        candidatePawn.MoveType = MoveType_t.MOVETYPE_NONE;
                 }
             }
 
@@ -359,22 +403,53 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             if (Config.SafeZoneEnabled)
                 InitSafeZone();
 
-            _roundActive = true;
-            _fuseRemaining = Config.FuseSeconds;
-            _graceRemaining = Config.GraceSeconds;
-            _lastPassTime = 0f;
+            // If freeze time is disabled, start immediately
+            if (Config.FreezeSeconds <= 0)
+            {
+                StartRoundPostFreeze();
+            }
+        });
+    }
 
-            var random = new Random();
-            var firstHolder = candidates[random.Next(candidates.Count)];
-            SetHolder(firstHolder);
+    private void StartRoundPostFreeze()
+    {
+        if (!_matchActive) return;
 
-            Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} ── ROUND {ChatColors.Green}{_currentRound}/{Config.RoundsPerMatch}{ChatColors.White} ── {ChatColors.Red}{firstHolder.PlayerName}{ChatColors.White} has the potato!");
-            if (Config.GraceSeconds > 0)
-                Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} Drain starts in {ChatColors.Red}{Config.GraceSeconds:0}{ChatColors.White} seconds!");
+        var candidates = GetAliveParticipants();
+        if (candidates.Count < 2)
+        {
+            Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} Not enough players, ending match.");
+            FinishMatch();
+            return;
+        }
 
+        foreach (var p in candidates)
+        {
+            var pawn = p.PlayerPawn?.Value;
+            if (pawn != null && pawn.IsValid)
+            {
+                pawn.MoveType = MoveType_t.MOVETYPE_WALK;
+            }
+        }
+
+        _roundActive = true;
+        _fuseRemaining = Config.FuseSeconds;
+        _graceRemaining = Config.GraceSeconds;
+        _lastPassTime = 0f;
+
+        var random = new Random();
+        var firstHolder = candidates[random.Next(candidates.Count)];
+        SetHolder(firstHolder);
+
+        Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} ── ROUND {ChatColors.Green}{_currentRound}/{Config.RoundsPerMatch}{ChatColors.White} ── {ChatColors.Red}{firstHolder.PlayerName}{ChatColors.White} has the potato!");
+        if (Config.GraceSeconds > 0)
+            Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} Drain starts in {ChatColors.Red}{Config.GraceSeconds:0}{ChatColors.White} seconds!");
+        
+        if (Config.FreezeSeconds <= 0)
+        {
             _tickTimer?.Kill();
             _tickTimer = AddTimer(1.0f, GameSecondTick, TimerFlags.REPEAT);
-        });
+        }
     }
 
     private void EndRound(CCSPlayerController? winner)
@@ -474,6 +549,15 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             {
                 p.Respawn();
             }
+            else
+            {
+                // Freeze already alive participants immediately
+                var pawn = p.PlayerPawn?.Value;
+                if (pawn != null && pawn.IsValid)
+                {
+                    pawn.MoveType = MoveType_t.MOVETYPE_NONE;
+                }
+            }
         }
     }
 
@@ -497,19 +581,53 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         if (spawns.Count == 0)
             return;
 
-        // Shuffle spawns, hand out one per player (wrap if more players than spawns)
         var random = new Random();
-        var shuffled = spawns.OrderBy(_ => random.Next()).ToList();
+        var selectedSpawns = new List<(Vector origin, QAngle angles)>();
+        var remainingSpawns = new List<(Vector origin, QAngle angles)>(spawns);
 
-        int i = 0;
+        // First player gets a random spawn
+        int firstIdx = random.Next(remainingSpawns.Count);
+        selectedSpawns.Add(remainingSpawns[firstIdx]);
+        remainingSpawns.RemoveAt(firstIdx);
+
+        // Farthest-point sampling for remaining players
+        for (int i = 1; i < players.Count; i++)
+        {
+            if (remainingSpawns.Count == 0) break; // Out of spawns (should be rare)
+
+            int bestIdx = 0;
+            float maxMinDist = -1f;
+
+            for (int j = 0; j < remainingSpawns.Count; j++)
+            {
+                float minDistToSelected = float.MaxValue;
+                foreach (var s in selectedSpawns)
+                {
+                    float dist = Distance2D(remainingSpawns[j].origin, s.origin);
+                    if (dist < minDistToSelected)
+                        minDistToSelected = dist;
+                }
+
+                if (minDistToSelected > maxMinDist)
+                {
+                    maxMinDist = minDistToSelected;
+                    bestIdx = j;
+                }
+            }
+
+            selectedSpawns.Add(remainingSpawns[bestIdx]);
+            remainingSpawns.RemoveAt(bestIdx);
+        }
+
+        int pIdx = 0;
         foreach (var p in players)
         {
             var pawn = p.PlayerPawn?.Value;
             if (pawn == null || !pawn.IsValid) continue;
 
-            var (origin, angles) = shuffled[i % shuffled.Count];
+            var (origin, angles) = selectedSpawns[pIdx % selectedSpawns.Count];
             pawn.Teleport(origin, angles, new Vector(0, 0, 0));
-            i++;
+            pIdx++;
         }
     }
 
@@ -517,7 +635,12 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
     private void InitSafeZone()
     {
-        // Center = average of all spawn origins, radius = spread + buffer
+        // Calculate the shrink time based on the player count (baseline is 4 players, minimum 30 seconds)
+        var candidates = GetAliveParticipants();
+        int playerCount = Math.Max(candidates.Count, 2);
+        _actualShrinkSeconds = Math.Max(Config.SafeZoneShrinkSeconds * (playerCount / 4.0f), 30f);
+
+        // Center = average of all spawn origins, radius = spread * 2
         var origins = new List<Vector>();
         foreach (var designerName in new[] { "info_player_terrorist", "info_player_counterterrorist" })
         {
@@ -531,7 +654,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         if (origins.Count == 0)
         {
             _zoneCenter = new Vector(0, 0, 0);
-            _zoneStartRadius = Config.SafeZoneStartRadius > 0 ? Config.SafeZoneStartRadius : 3000f;
+            _zoneStartRadius = Config.SafeZoneStartRadius > 0 ? Config.SafeZoneStartRadius : 6000f;
         }
         else
         {
@@ -547,13 +670,18 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             else
             {
                 float maxDist = origins.Max(o => Distance2D(o, _zoneCenter));
-                _zoneStartRadius = maxDist + 500f;
+                _zoneStartRadius = maxDist * 2f;
             }
         }
 
         _zoneRadius = _zoneStartRadius;
         _zoneElapsed = 0f;
-        _lastBeamUpdate = -999f;
+
+        if (Config.SafeZoneBeamSegments > 0)
+        {
+            CreateZoneBeams();
+            UpdateZoneBeams();
+        }
     }
 
     private void TickSafeZone()
@@ -563,7 +691,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
         _zoneElapsed += 1.0f;
 
-        float t = Math.Clamp(_zoneElapsed / Config.SafeZoneShrinkSeconds, 0f, 1f);
+        float t = Math.Clamp(_zoneElapsed / _actualShrinkSeconds, 0f, 1f);
         _zoneRadius = _zoneStartRadius + (Config.SafeZoneMinRadius - _zoneStartRadius) * t;
 
         // Damage players outside the zone (direct health modification, same
@@ -591,61 +719,156 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             }
         }
 
-        // Refresh the visual ring every 3 seconds (recreating beams too often
-        // causes entity churn)
-        if (Config.SafeZoneBeamSegments > 0 && _zoneElapsed - _lastBeamUpdate >= 3f)
+        if (Config.SafeZoneBeamSegments > 0)
         {
-            _lastBeamUpdate = _zoneElapsed;
-            DrawZoneRing();
+            UpdateZoneBeams();
         }
     }
 
-    private void DrawZoneRing()
+    private void CreateZoneBeams()
     {
-        RemoveZoneBeams();
+        // FIX: Reuse beams across rounds to prevent CS2 from hitting the edict limit in later rounds!
+        if (_zoneBeams.Count > 0) return; 
 
-        int segments = Config.SafeZoneBeamSegments;
-        float zLow = _zoneCenter.Z + 10f;
-        float zHigh = zLow + Config.SafeZoneWallHeight;
-
-        // Precompute the ring points once
-        var lowPoints = new Vector[segments + 1];
-        var highPoints = new Vector[segments + 1];
-        for (int i = 0; i <= segments; i++)
+        if (_zoneCenterEntity == null || !_zoneCenterEntity.IsValid)
         {
-            float a = (float)(2 * Math.PI * i / segments);
+            _zoneCenterEntity = Utilities.CreateEntityByName<CBaseEntity>("info_target");
+            if (_zoneCenterEntity != null)
+            {
+                _zoneCenterEntity.Teleport(_zoneCenter, new QAngle(0, 0, 0), new Vector(0, 0, 0));
+                _zoneCenterEntity.DispatchSpawn();
+            }
+        }
+
+        // Override to 32 for dense circle without exceeding engine limits
+        int segments = 32; 
+        
+        int numRings = 4;
+        // 4 horizontal rings + 3 short vertical segments per pillar (frustum culling fixed by keeping segments short)
+        int totalBeams = segments * (numRings + (numRings - 1)); 
+        for (int i = 0; i < totalBeams; i++)
+        {
+            var beam = Utilities.CreateEntityByName<CBeam>("beam");
+            if (beam != null)
+            {
+                beam.Render = Color.FromArgb(255, 255, 60, 60);
+                beam.Width = 3.0f;
+
+                // Force EF_NOCULL (128) so the client never frustum culls the beam even if both endpoints are off-screen
+                beam.Effects |= 128;
+                Utilities.SetStateChanged(beam, "CBaseEntity", "m_fEffects");
+
+                // Fix CS2 frustum culling completely by forcing a massive bounding box
+                beam.Collision.Mins.X = -10000;
+                beam.Collision.Mins.Y = -10000;
+                beam.Collision.Mins.Z = -10000;
+                beam.Collision.Maxs.X = 10000;
+                beam.Collision.Maxs.Y = 10000;
+                beam.Collision.Maxs.Z = 10000;
+                beam.Collision.SolidType = SolidType_t.SOLID_BBOX;
+
+                beam.DispatchSpawn();
+
+                if (_zoneCenterEntity != null && _zoneCenterEntity.IsValid)
+                {
+                    beam.AcceptInput("SetParent", _zoneCenterEntity, null, "");
+                }
+
+                Utilities.SetStateChanged(beam, "CCollisionProperty", "m_vecMins");
+                Utilities.SetStateChanged(beam, "CCollisionProperty", "m_vecMaxs");
+                Utilities.SetStateChanged(beam, "CCollisionProperty", "m_nSolidType");
+
+                _zoneBeams.Add(beam);
+            }
+        }
+    }
+
+    private void UpdateZoneBeams()
+    {
+        if (_zoneCenterEntity != null && _zoneCenterEntity.IsValid)
+        {
+            _zoneCenterEntity.Teleport(_zoneCenter, new QAngle(0, 0, 0), new Vector(0, 0, 0));
+        }
+
+        int maxSegments = 32;
+        int numRings = 4;
+        if (_zoneBeams.Count < maxSegments * (numRings + (numRings - 1))) return;
+
+        // Keep segments constant so the beams are always short enough to not be completely off-screen!
+        int activeSegments = maxSegments;
+
+        // Extend the cage height lower and higher
+        float zLow = _zoneCenter.Z - 300f;
+        float zHigh = _zoneCenter.Z + Math.Max(Config.SafeZoneWallHeight, 600f);
+
+        // Calculate ring heights
+        float[] ringHeights = new float[numRings];
+        for (int r = 0; r < numRings; r++)
+        {
+            ringHeights[r] = zLow + ((zHigh - zLow) * ((float)r / (numRings - 1)));
+        }
+
+        var ringPoints = new Vector[numRings][];
+        for (int r = 0; r < numRings; r++)
+        {
+            ringPoints[r] = new Vector[activeSegments + 1];
+        }
+        
+        for (int i = 0; i <= activeSegments; i++)
+        {
+            float a = (float)(2 * Math.PI * i / activeSegments);
             float x = _zoneCenter.X + _zoneRadius * MathF.Cos(a);
             float y = _zoneCenter.Y + _zoneRadius * MathF.Sin(a);
-            lowPoints[i] = new Vector(x, y, zLow);
-            highPoints[i] = new Vector(x, y, zHigh);
+            for (int r = 0; r < numRings; r++)
+            {
+                ringPoints[r][i] = new Vector(x, y, ringHeights[r]);
+            }
         }
 
-        for (int i = 0; i < segments; i++)
+        int beamIndex = 0;
+        for (int i = 0; i < activeSegments; i++)
         {
-            // Bottom ring segment
-            SpawnBeam(lowPoints[i], lowPoints[i + 1]);
-            // Top ring segment
-            SpawnBeam(highPoints[i], highPoints[i + 1]);
-            // Vertical post connecting the rings (the "cage" bars that make
-            // the wall visible from any height)
-            SpawnBeam(lowPoints[i], highPoints[i]);
+            // Draw horizontal rings
+            for (int r = 0; r < numRings; r++)
+            {
+                UpdateBeam(_zoneBeams[beamIndex++], ringPoints[r][i], ringPoints[r][i + 1]);
+            }
+            // Draw vertical pillars split into multiple shorter segments to prevent frustum culling
+            for (int r = 0; r < numRings - 1; r++)
+            {
+                UpdateBeam(_zoneBeams[beamIndex++], ringPoints[r][i], ringPoints[r + 1][i]);
+            }
+        }
+
+        // Hide unused beams to prevent them from rendering at the origin
+        // FIX: Start and end points MUST be different, otherwise CS2 renderer aborts rendering
+        // due to zero-length math errors causing the whole circle to vanish.
+        Vector underground1 = new Vector(0, 0, -10000);
+        Vector underground2 = new Vector(0, 0, -9900);
+        while (beamIndex < _zoneBeams.Count)
+        {
+            UpdateBeam(_zoneBeams[beamIndex++], underground1, underground2);
         }
     }
 
-    private void SpawnBeam(Vector start, Vector end)
+    private void UpdateBeam(CBeam beam, Vector start, Vector end)
     {
-        var beam = Utilities.CreateEntityByName<CBeam>("beam");
-        if (beam == null) return;
-
-        beam.Render = Color.FromArgb(255, 255, 60, 60);
-        beam.Width = 3.0f;
+        if (!beam.IsValid) return;
         beam.Teleport(start, new QAngle(0, 0, 0), new Vector(0, 0, 0));
         beam.EndPos.X = end.X;
         beam.EndPos.Y = end.Y;
         beam.EndPos.Z = end.Z;
-        beam.DispatchSpawn();
+        Utilities.SetStateChanged(beam, "CBeam", "m_vecEndPos");
 
-        _zoneBeams.Add(beam);
+        // Force massive bounds AFTER teleport so CS2 doesn't frustum cull it when looking down/away
+        beam.Collision.Mins.X = -10000;
+        beam.Collision.Mins.Y = -10000;
+        beam.Collision.Mins.Z = -10000;
+        beam.Collision.Maxs.X = 10000;
+        beam.Collision.Maxs.Y = 10000;
+        beam.Collision.Maxs.Z = 10000;
+        Utilities.SetStateChanged(beam, "CCollisionProperty", "m_vecMins");
+        Utilities.SetStateChanged(beam, "CCollisionProperty", "m_vecMaxs");
     }
 
     private void RemoveZoneBeams()
@@ -656,16 +879,38 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
                 beam.Remove();
         }
         _zoneBeams.Clear();
+
+        if (_zoneCenterEntity != null && _zoneCenterEntity.IsValid)
+        {
+            _zoneCenterEntity.Remove();
+            _zoneCenterEntity = null;
+        }
     }
 
     // ---------------- Main game tick ----------------
 
     private void GameSecondTick()
     {
-        if (!_matchActive || !_roundActive)
+        if (!_matchActive)
             return;
 
-        if (IsFreezePeriod())
+        if (_freezeRemaining > 0f)
+        {
+            var candidates = GetAliveParticipants();
+            foreach (var p in candidates)
+            {
+                p.PrintToCenter($"YOU WILL BE ABLE TO MOVE IN: {_freezeRemaining:0} sec");
+            }
+            
+            _freezeRemaining -= 1.0f;
+            if (_freezeRemaining <= 0f)
+            {
+                StartRoundPostFreeze();
+            }
+            return;
+        }
+
+        if (!_roundActive)
             return;
 
         if (_graceRemaining > 0f)
@@ -673,6 +918,11 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             _graceRemaining -= 1.0f;
             if (_graceRemaining is 3f or 2f or 1f)
                 Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} Drain starts in {ChatColors.Red}{_graceRemaining:0}{ChatColors.White}...");
+            
+            if (_holder != null && IsValidAlive(_holder))
+            {
+                _holder.PrintToCenter($"GRACE PERIOD: {_graceRemaining:0}s\nGET READY!");
+            }
             return;
         }
 
@@ -699,6 +949,8 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
         if (_fuseRemaining is 10f or 5f or 3f or 2f or 1f)
             Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.Red} {_fuseRemaining:0} seconds!");
+
+        _holder.PrintToCenter($"POTATO EXPLODES IN: {_fuseRemaining:0}s\nPASS IT (E / Knife)!");
 
         if (_fuseRemaining <= 0f)
         {
@@ -812,7 +1064,27 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
     private void OnTick()
     {
-        if (!_matchActive || !_roundActive || _holder == null || !IsValidAlive(_holder))
+        if (!_matchActive)
+            return;
+
+        if (_freezeRemaining > 0f)
+        {
+            foreach (var p in GetAliveParticipants())
+            {
+                var playerPawn = p.PlayerPawn?.Value;
+                if (playerPawn != null && playerPawn.IsValid)
+                {
+                    playerPawn.MoveType = MoveType_t.MOVETYPE_NONE;
+                    playerPawn.AbsVelocity.X = 0;
+                    playerPawn.AbsVelocity.Y = 0;
+                    playerPawn.AbsVelocity.Z = 0;
+                    Utilities.SetStateChanged(playerPawn, "CBaseEntity", "m_vecAbsVelocity");
+                }
+            }
+            return;
+        }
+
+        if (!_roundActive || _holder == null || !IsValidAlive(_holder))
             return;
 
         var pawn = _holder.PlayerPawn?.Value;
@@ -852,7 +1124,10 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             var targetOrigin = p.PlayerPawn?.Value?.AbsOrigin;
             if (targetOrigin == null) continue;
 
-            float dist = Distance(origin, targetOrigin);
+            float zDiff = Math.Abs(origin.Z - targetOrigin.Z);
+            if (zDiff > 80f) continue;
+
+            float dist = Distance2D(origin, targetOrigin);
             if (dist < nearestDist)
             {
                 nearestDist = dist;
@@ -872,6 +1147,9 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         SetHolder(to);
 
         Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} {from.PlayerName} passed the potato to {ChatColors.Red}{to.PlayerName}{ChatColors.White}!");
+        
+        to.ExecuteClientCommand("play sounds/ui/armsrace_level_up.vsnd");
+        from.ExecuteClientCommand("play sounds/ui/armsrace_kill_01.vsnd");
     }
 
     // ---------------- Damage handling ----------------
@@ -896,43 +1174,47 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
     private HookResult OnTakeDamage(DynamicHook hook)
     {
-        if (!_roundActive || !Config.DisablePlayerDamage)
-            return HookResult.Continue;
-
-        if (_bypassDamageBlock)
-            return HookResult.Continue;
-
-        var victimEntity = hook.GetParam<CEntityInstance>(0);
-        if (victimEntity.DesignerName != "player")
+        if (!_matchActive)
             return HookResult.Continue;
 
         var damageInfo = hook.GetParam<CTakeDamageInfo>(1);
+        var victimEntity = hook.GetParam<CEntityInstance>(0);
 
-        var attackerEntity = damageInfo.Attacker.Value;
-        if (attackerEntity == null || attackerEntity.DesignerName != "player")
-            return HookResult.Continue;
+        bool blockDamage = !_roundActive || Config.DisablePlayerDamage;
+        if (_bypassDamageBlock)
+            blockDamage = false;
 
-        if (attackerEntity.Index == victimEntity.Index)
-            return HookResult.Continue;
-
-        var victimPawn = victimEntity.As<CCSPlayerPawn>();
-        var attackerPawn = attackerEntity.As<CCSPlayerPawn>();
-
-        var victimController = victimPawn.OriginalController?.Value;
-        var attackerController = attackerPawn.OriginalController?.Value;
-
-        if (victimController != null && attackerController != null &&
-            _holder != null && attackerController.Slot == _holder.Slot)
+        if (_roundActive && victimEntity.DesignerName == "player")
         {
-            var weaponName = damageInfo.Ability.Value?.DesignerName ?? "";
-            if (weaponName.Contains("knife", StringComparison.OrdinalIgnoreCase) ||
-                weaponName.Contains("bayonet", StringComparison.OrdinalIgnoreCase))
+            var attackerEntity = damageInfo.Attacker.Value;
+            if (attackerEntity != null && attackerEntity.DesignerName == "player" && attackerEntity.Index != victimEntity.Index)
             {
-                PassPotato(attackerController, victimController);
+                var victimPawn = victimEntity.As<CCSPlayerPawn>();
+                var attackerPawn = attackerEntity.As<CCSPlayerPawn>();
+
+                var victimController = victimPawn.OriginalController?.Value;
+                var attackerController = attackerPawn.OriginalController?.Value;
+
+                if (victimController != null && attackerController != null &&
+                    _holder != null && attackerController.Slot == _holder.Slot)
+                {
+                    var weaponName = damageInfo.Ability.Value?.DesignerName ?? "";
+                    if (weaponName.Contains("knife", StringComparison.OrdinalIgnoreCase) ||
+                        weaponName.Contains("bayonet", StringComparison.OrdinalIgnoreCase))
+                    {
+                        PassPotato(attackerController, victimController);
+                    }
+                }
             }
         }
 
-        return HookResult.Handled;
+        if (blockDamage)
+        {
+            damageInfo.Damage = 0;
+            return HookResult.Changed;
+        }
+
+        return HookResult.Continue;
     }
 
     // ---------------- Spawn / death / detonation / win ----------------
@@ -942,6 +1224,22 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         var player = @event.Userid;
         if (player == null || !player.IsValid)
             return HookResult.Continue;
+
+        // Freeze immediately if spawned during freeze period
+        if (_freezeRemaining > 0 && _participants.Contains(player.Slot))
+        {
+            AddTimer(0.05f, () =>
+            {
+                if (player.IsValid && player.PawnIsAlive)
+                {
+                    var pawn = player.PlayerPawn?.Value;
+                    if (pawn != null && pawn.IsValid)
+                    {
+                        pawn.MoveType = MoveType_t.MOVETYPE_NONE;
+                    }
+                }
+            });
+        }
 
         AddTimer(0.3f, () =>
         {
@@ -987,7 +1285,12 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             return HookResult.Continue;
         }
 
-        CheckRoundWinner();
+        AddTimer(0.1f, () =>
+        {
+            if (_roundActive)
+                CheckRoundWinner();
+        });
+        
         return HookResult.Continue;
     }
 
@@ -1050,7 +1353,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             foreach (var p in Utilities.GetPlayers())
             {
                 if (p.IsValid && !p.IsBot)
-                    p.ExecuteClientCommand($"play {Config.ExplosionSoundPath}");
+                    p.ExecuteClientCommand("play sounds/ui/armsrace_demoted.vsnd");
             }
         }
 
