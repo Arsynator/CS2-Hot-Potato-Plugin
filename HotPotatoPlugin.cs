@@ -131,6 +131,12 @@ public class HotPotatoConfig : BasePluginConfig
     [JsonPropertyName("AntiCampRevealSeconds")]
     public float AntiCampRevealSeconds { get; set; } = 3f;
 
+    // After this many camp detections in a single round, the potato is force-
+    // passed to the repeat camper as a penalty. 0 disables the penalty (reveal
+    // only). Default 5.
+    [JsonPropertyName("AntiCampPenaltyStrikes")]
+    public int AntiCampPenaltyStrikes { get; set; } = 5;
+
     // Server commands executed when a match starts. Defaults end warmup,
     // disable respawns, and prevent rounds ending mid-game. Adjust these
     // if your server doesn't run an infinite-warmup setup.
@@ -188,6 +194,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         config.AntiCampSeconds = Math.Clamp(config.AntiCampSeconds, 2f, 120f);
         config.AntiCampRadius = Math.Clamp(config.AntiCampRadius, 30f, 1000f);
         config.AntiCampRevealSeconds = Math.Clamp(config.AntiCampRevealSeconds, 1f, 30f);
+        config.AntiCampPenaltyStrikes = Math.Clamp(config.AntiCampPenaltyStrikes, 0, 100);
 
         Config = config;
     }
@@ -230,7 +237,11 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
     private readonly Dictionary<int, Vector> _campAnchor = new();
     private readonly Dictionary<int, float> _campAnchorTime = new();
     private readonly Dictionary<int, float> _campRevealUntil = new();
+    private readonly Dictionary<int, int> _campStrikes = new();
     private CounterStrikeSharp.API.Modules.Timers.Timer? _hudTimer;
+    // Composed HUD text per slot; printed every tick so the center HTML
+    // never fades out between refreshes (which caused visible flashing)
+    private readonly Dictionary<int, string> _hudText = new();
 
     private CounterStrikeSharp.API.Modules.Timers.Timer? _tickTimer;
 
@@ -508,6 +519,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         _campAnchor.Clear();
         _campAnchorTime.Clear();
         _campRevealUntil.Clear();
+        _campStrikes.Clear();
     }
 
     // ---------------- Respawning & spawn spreading ----------------
@@ -664,6 +676,13 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
                     finally { _bypassDamageBlock = false; }
 
                     Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} {p.PlayerName} died outside the zone!");
+                    _outsideZone.Remove(p.Slot);
+
+                    // A zone death can leave a single survivor; check the win
+                    // condition right away so the last player is credited
+                    // instead of the round dragging on until they die too.
+                    if (CheckRoundWinner())
+                        return;
                 }
             }
             else
@@ -805,6 +824,12 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         if (Config.AntiCampEnabled)
             TickAntiCamp();
 
+        // TickSafeZone (or anti-camp) may have ended the round via a zone
+        // death that left a single survivor. If so, stop here — the round is
+        // already scored and the drain/fuse must not run.
+        if (!_roundActive)
+            return;
+
         if (_holder == null || !IsValidAlive(_holder))
             return;
 
@@ -938,6 +963,18 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
     private void OnTick()
     {
+        // Re-assert the cached HUD every tick so it displays continuously
+        // without fading (composition happens in UpdateHud on a slower timer)
+        if (_matchActive && _roundActive && _hudText.Count > 0)
+        {
+            foreach (var kv in _hudText)
+            {
+                var hudPlayer = Utilities.GetPlayerFromSlot(kv.Key);
+                if (hudPlayer != null && hudPlayer.IsValid && hudPlayer.PawnIsAlive)
+                    hudPlayer.PrintToCenterHtml(kv.Value);
+            }
+        }
+
         if (!_matchActive || !_roundActive || _holder == null || !IsValidAlive(_holder))
             return;
 
@@ -1147,6 +1184,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         _campAnchor.Remove(player.Slot);
         _campAnchorTime.Remove(player.Slot);
         _campRevealUntil.Remove(player.Slot);
+        _campStrikes.Remove(player.Slot);
 
         if (_roundActive && _holder != null && player.Slot == _holder.Slot)
         {
@@ -1258,6 +1296,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             {
                 _campAnchor.Remove(p.Slot);
                 _campAnchorTime.Remove(p.Slot);
+                _campStrikes.Remove(p.Slot);
                 continue;
             }
 
@@ -1277,8 +1316,24 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
             if (_zoneElapsed - _campAnchorTime.GetValueOrDefault(p.Slot) >= Config.AntiCampSeconds)
             {
-                _campRevealUntil[p.Slot] = Server.CurrentTime + Config.AntiCampRevealSeconds;
                 _campAnchorTime[p.Slot] = _zoneElapsed; // re-arm for repeat offenders
+                int strikes = _campStrikes.GetValueOrDefault(p.Slot) + 1;
+                _campStrikes[p.Slot] = strikes;
+
+                // Repeat offender: force the potato onto them as a penalty
+                if (Config.AntiCampPenaltyStrikes > 0 &&
+                    strikes >= Config.AntiCampPenaltyStrikes &&
+                    _holder != null && p.Slot != _holder.Slot &&
+                    _graceRemaining <= 0f)
+                {
+                    _campStrikes[p.Slot] = 0; // reset after penalty
+                    _campRevealUntil.Remove(p.Slot);
+                    Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} 🥔 {ChatColors.Red}{p.PlayerName}{ChatColors.White} camped too much — HERE'S THE POTATO!");
+                    PassPotato(_holder, p);
+                    return; // one penalty per tick
+                }
+
+                _campRevealUntil[p.Slot] = Server.CurrentTime + Config.AntiCampRevealSeconds;
                 Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} 👁 {ChatColors.Red}{p.PlayerName}{ChatColors.White} is camping and has been revealed!");
             }
         }
@@ -1290,6 +1345,8 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
     // zone warning, and camp reveal never overwrite each other.
     private void UpdateHud()
     {
+        _hudText.Clear();
+
         if (!_matchActive || !_roundActive)
             return;
 
@@ -1320,7 +1377,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
                 lines.Add("<font color='#FF8800'>👁 CAMPING — POSITION REVEALED</font>");
 
             if (lines.Count > 0)
-                p.PrintToCenterHtml(string.Join("<br>", lines));
+                _hudText[p.Slot] = string.Join("<br>", lines);
         }
     }
 
