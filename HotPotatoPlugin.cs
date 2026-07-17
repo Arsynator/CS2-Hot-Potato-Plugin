@@ -101,9 +101,35 @@ public class HotPotatoConfig : BasePluginConfig
     [JsonPropertyName("SafeZoneBeamSegments")]
     public int SafeZoneBeamSegments { get; set; } = 24;
 
-    // Height of the zone "cage" wall (bottom ring, top ring, vertical posts)
+    // Extra wall height above the highest spawn point. On vertical maps the
+    // wall automatically spans from below the lowest spawn to above the
+    // highest one; this adds margin on top.
     [JsonPropertyName("SafeZoneWallHeight")]
     public float SafeZoneWallHeight { get; set; } = 400f;
+
+    // How fast (units/second) the zone center drifts to force movement.
+    // 0 disables drifting entirely.
+    [JsonPropertyName("SafeZoneDriftPerSecond")]
+    public float SafeZoneDriftPerSecond { get; set; } = 12f;
+
+    // ---- Anti-camp ----
+
+    // Reveal players on the radar if they stay in one spot too long
+    [JsonPropertyName("AntiCampEnabled")]
+    public bool AntiCampEnabled { get; set; } = true;
+
+    // How long (seconds) a player can stay within AntiCampRadius before
+    // being revealed
+    [JsonPropertyName("AntiCampSeconds")]
+    public float AntiCampSeconds { get; set; } = 8f;
+
+    // How far (units) a player must move to reset the camp timer
+    [JsonPropertyName("AntiCampRadius")]
+    public float AntiCampRadius { get; set; } = 150f;
+
+    // How long (seconds) the camper stays revealed on the radar
+    [JsonPropertyName("AntiCampRevealSeconds")]
+    public float AntiCampRevealSeconds { get; set; } = 3f;
 
     // Server commands executed when a match starts. Defaults end warmup,
     // disable respawns, and prevent rounds ending mid-game. Adjust these
@@ -138,7 +164,7 @@ public class HotPotatoConfig : BasePluginConfig
 public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 {
     public override string ModuleName => "Hot Potato";
-    public override string ModuleVersion => "2.0.0";
+    public override string ModuleVersion => "2.2.0";
     public override string ModuleAuthor => "Arsy";
     public override string ModuleDescription => "Hot Potato keep-away gamemode: multi-round matches, glow, radar, shrinking zone";
 
@@ -158,6 +184,10 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         config.SafeZoneShrinkSeconds = Math.Clamp(config.SafeZoneShrinkSeconds, 10f, 600f);
         config.SafeZoneDamagePerSecond = Math.Clamp(config.SafeZoneDamagePerSecond, 1, 100);
         config.SafeZoneBeamSegments = Math.Clamp(config.SafeZoneBeamSegments, 0, 64);
+        config.SafeZoneDriftPerSecond = Math.Clamp(config.SafeZoneDriftPerSecond, 0f, 200f);
+        config.AntiCampSeconds = Math.Clamp(config.AntiCampSeconds, 2f, 120f);
+        config.AntiCampRadius = Math.Clamp(config.AntiCampRadius, 30f, 1000f);
+        config.AntiCampRevealSeconds = Math.Clamp(config.AntiCampRevealSeconds, 1f, 30f);
 
         Config = config;
     }
@@ -189,6 +219,18 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
     private float _zoneElapsed = 0f;
     private readonly List<CBeam> _zoneBeams = new();
     private float _lastBeamUpdate = 0f;
+    private float _zoneWallLow = 0f;
+    private float _zoneWallHigh = 0f;
+    private Vector _zoneOriginalCenter = new(0, 0, 0);
+    private Vector _zoneDriftTarget = new(0, 0, 0);
+    private float _nextDriftRetarget = 0f;
+
+    // ---------------- HUD & anti-camp state ----------------
+    private readonly HashSet<int> _outsideZone = new();
+    private readonly Dictionary<int, Vector> _campAnchor = new();
+    private readonly Dictionary<int, float> _campAnchorTime = new();
+    private readonly Dictionary<int, float> _campRevealUntil = new();
+    private CounterStrikeSharp.API.Modules.Timers.Timer? _hudTimer;
 
     private CounterStrikeSharp.API.Modules.Timers.Timer? _tickTimer;
 
@@ -218,11 +260,16 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         RegisterListener<Listeners.OnTick>(OnTick);
 
         VirtualFunctions.CBaseEntity_TakeDamageOldFunc.Hook(OnTakeDamage, HookMode.Pre);
+
+        // Unified center HUD: one place composes potato status, zone warning,
+        // and camp reveal so the messages never overwrite each other
+        _hudTimer = AddTimer(0.5f, UpdateHud, TimerFlags.REPEAT);
     }
 
     public override void Unload(bool hotReload)
     {
         VirtualFunctions.CBaseEntity_TakeDamageOldFunc.Unhook(OnTakeDamage, HookMode.Pre);
+        _hudTimer?.Kill();
         StopMatch(announce: false);
     }
 
@@ -456,6 +503,11 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
         RemoveGlow();
         RemoveZoneBeams();
+
+        _outsideZone.Clear();
+        _campAnchor.Clear();
+        _campAnchorTime.Clear();
+        _campRevealUntil.Clear();
     }
 
     // ---------------- Respawning & spawn spreading ----------------
@@ -517,7 +569,9 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
     private void InitSafeZone()
     {
-        // Center = average of all spawn origins, radius = spread + buffer
+        // Center = average of all spawn origins, radius = spread + buffer.
+        // The wall's vertical span is derived from the spawn Z range so the
+        // cage is visible on every level of vertical maps like Nuke/Vertigo.
         var origins = new List<Vector>();
         foreach (var designerName in new[] { "info_player_terrorist", "info_player_counterterrorist" })
         {
@@ -551,9 +605,30 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             }
         }
 
+        // Vertical wall span: from just below the lowest spawn to
+        // SafeZoneWallHeight above the highest spawn. On flat maps this
+        // degenerates gracefully to roughly the old fixed-height cage.
+        if (origins.Count > 0)
+        {
+            float zMin = origins.Min(o => o.Z);
+            float zMax = origins.Max(o => o.Z);
+            _zoneWallLow = zMin - 64f;
+            _zoneWallHigh = zMax + Config.SafeZoneWallHeight;
+        }
+        else
+        {
+            _zoneWallLow = _zoneCenter.Z + 10f;
+            _zoneWallHigh = _zoneWallLow + Config.SafeZoneWallHeight;
+        }
+
+        _zoneOriginalCenter = new Vector(_zoneCenter.X, _zoneCenter.Y, _zoneCenter.Z);
+        _zoneDriftTarget = new Vector(_zoneCenter.X, _zoneCenter.Y, _zoneCenter.Z);
+        _nextDriftRetarget = 0f;
+
         _zoneRadius = _zoneStartRadius;
         _zoneElapsed = 0f;
         _lastBeamUpdate = -999f;
+        _outsideZone.Clear();
     }
 
     private void TickSafeZone()
@@ -565,6 +640,8 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
         float t = Math.Clamp(_zoneElapsed / Config.SafeZoneShrinkSeconds, 0f, 1f);
         _zoneRadius = _zoneStartRadius + (Config.SafeZoneMinRadius - _zoneStartRadius) * t;
+
+        TickZoneDrift();
 
         // Damage players outside the zone (direct health modification, same
         // path as the potato drain, so the damage-block hook doesn't matter)
@@ -578,7 +655,7 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             {
                 pawn.Health -= Config.SafeZoneDamagePerSecond;
                 Utilities.SetStateChanged(pawn, "CBaseEntity", "m_iHealth");
-                p.PrintToCenter($"⚠ OUTSIDE THE ZONE! -{Config.SafeZoneDamagePerSecond} HP/s ⚠");
+                _outsideZone.Add(p.Slot); // HUD compositor shows the warning
 
                 if (pawn.Health <= 0)
                 {
@@ -588,6 +665,10 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
                     Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} {p.PlayerName} died outside the zone!");
                 }
+            }
+            else
+            {
+                _outsideZone.Remove(p.Slot);
             }
         }
 
@@ -600,35 +681,77 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         }
     }
 
+    // Slowly moves the zone center toward a wandering target so players are
+    // forced to reposition even inside the safe area. The target is re-rolled
+    // periodically within a fraction of the CURRENT radius around the
+    // original center, so the zone never wanders off the playable area.
+    private void TickZoneDrift()
+    {
+        if (Config.SafeZoneDriftPerSecond <= 0f)
+            return;
+
+        if (_zoneElapsed >= _nextDriftRetarget)
+        {
+            _nextDriftRetarget = _zoneElapsed + 15f;
+            var random = new Random();
+            float angle = (float)(random.NextDouble() * 2 * Math.PI);
+            float dist = (float)(random.NextDouble() * _zoneRadius * 0.4f);
+            _zoneDriftTarget = new Vector(
+                _zoneOriginalCenter.X + dist * MathF.Cos(angle),
+                _zoneOriginalCenter.Y + dist * MathF.Sin(angle),
+                _zoneCenter.Z);
+        }
+
+        float dx = _zoneDriftTarget.X - _zoneCenter.X;
+        float dy = _zoneDriftTarget.Y - _zoneCenter.Y;
+        float d = MathF.Sqrt(dx * dx + dy * dy);
+        if (d < 1f)
+            return;
+
+        float step = Math.Min(Config.SafeZoneDriftPerSecond, d);
+        _zoneCenter = new Vector(
+            _zoneCenter.X + dx / d * step,
+            _zoneCenter.Y + dy / d * step,
+            _zoneCenter.Z);
+    }
+
     private void DrawZoneRing()
     {
         RemoveZoneBeams();
 
         int segments = Config.SafeZoneBeamSegments;
-        float zLow = _zoneCenter.Z + 10f;
-        float zHigh = zLow + Config.SafeZoneWallHeight;
+        float zLow = _zoneWallLow;
+        float zHigh = Math.Max(_zoneWallHigh, zLow + 200f);
 
-        // Precompute the ring points once
-        var lowPoints = new Vector[segments + 1];
-        var highPoints = new Vector[segments + 1];
+        // Ring count scales with the vertical span so tall maps (Nuke,
+        // Vertigo) get intermediate rings on every level: one ring per
+        // ~350 units of height, between 2 and 4 rings total. Posts connect
+        // consecutive rings so the wall reads as a cage from anywhere.
+        int numRings = Math.Clamp((int)MathF.Ceiling((zHigh - zLow) / 350f) + 1, 2, 4);
+
+        var ringZ = new float[numRings];
+        for (int r = 0; r < numRings; r++)
+            ringZ[r] = zLow + (zHigh - zLow) * r / (numRings - 1);
+
+        var points = new Vector[numRings][];
+        for (int r = 0; r < numRings; r++)
+            points[r] = new Vector[segments + 1];
+
         for (int i = 0; i <= segments; i++)
         {
             float a = (float)(2 * Math.PI * i / segments);
             float x = _zoneCenter.X + _zoneRadius * MathF.Cos(a);
             float y = _zoneCenter.Y + _zoneRadius * MathF.Sin(a);
-            lowPoints[i] = new Vector(x, y, zLow);
-            highPoints[i] = new Vector(x, y, zHigh);
+            for (int r = 0; r < numRings; r++)
+                points[r][i] = new Vector(x, y, ringZ[r]);
         }
 
         for (int i = 0; i < segments; i++)
         {
-            // Bottom ring segment
-            SpawnBeam(lowPoints[i], lowPoints[i + 1]);
-            // Top ring segment
-            SpawnBeam(highPoints[i], highPoints[i + 1]);
-            // Vertical post connecting the rings (the "cage" bars that make
-            // the wall visible from any height)
-            SpawnBeam(lowPoints[i], highPoints[i]);
+            for (int r = 0; r < numRings; r++)
+                SpawnBeam(points[r][i], points[r][i + 1]);      // rings
+            for (int r = 0; r < numRings - 1; r++)
+                SpawnBeam(points[r][i], points[r + 1][i]);      // posts
         }
     }
 
@@ -678,6 +801,9 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
         // Safe zone ticks even if the holder is momentarily invalid
         TickSafeZone();
+
+        if (Config.AntiCampEnabled)
+            TickAntiCamp();
 
         if (_holder == null || !IsValidAlive(_holder))
             return;
@@ -823,6 +949,22 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
 
         if (Config.HolderRadarBlip)
             ApplyRadarBlip(pawn);
+
+        // Revealed campers blip on the radar for the reveal duration
+        if (Config.AntiCampEnabled && _campRevealUntil.Count > 0)
+        {
+            foreach (var kv in _campRevealUntil)
+            {
+                if (kv.Value <= Server.CurrentTime) continue;
+                var camper = Utilities.GetPlayerFromSlot(kv.Key);
+                var camperPawn = camper?.PlayerPawn?.Value;
+                if (camper != null && camper.IsValid && camper.PawnIsAlive &&
+                    camperPawn != null && camperPawn.IsValid)
+                {
+                    ApplyRadarBlip(camperPawn);
+                }
+            }
+        }
 
         bool usePressed = (_holder.Buttons & PlayerButtons.Use) != 0;
         if (usePressed && !_lastUsePressed)
@@ -1001,6 +1143,10 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
             return HookResult.Continue;
 
         _participants.Remove(player.Slot);
+        _outsideZone.Remove(player.Slot);
+        _campAnchor.Remove(player.Slot);
+        _campAnchorTime.Remove(player.Slot);
+        _campRevealUntil.Remove(player.Slot);
 
         if (_roundActive && _holder != null && player.Slot == _holder.Slot)
         {
@@ -1097,6 +1243,85 @@ public class HotPotatoPlugin : BasePlugin, IPluginConfig<HotPotatoConfig>
         }
 
         return false;
+    }
+
+    // ---------------- Anti-camp ----------------
+
+    // If a non-holder stays within AntiCampRadius for AntiCampSeconds, they
+    // get revealed on everyone's radar for AntiCampRevealSeconds. The holder
+    // is exempt: camping as the holder is already suicide via the drain.
+    private void TickAntiCamp()
+    {
+        foreach (var p in GetAliveParticipants())
+        {
+            if (_holder != null && p.Slot == _holder.Slot)
+            {
+                _campAnchor.Remove(p.Slot);
+                _campAnchorTime.Remove(p.Slot);
+                continue;
+            }
+
+            var origin = p.PlayerPawn?.Value?.AbsOrigin;
+            if (origin == null) continue;
+
+            var pos = new Vector(origin.X, origin.Y, origin.Z);
+
+            if (!_campAnchor.TryGetValue(p.Slot, out var anchor) ||
+                Distance2D(pos, anchor) > Config.AntiCampRadius)
+            {
+                // Moved enough (or first sample): reset the anchor
+                _campAnchor[p.Slot] = pos;
+                _campAnchorTime[p.Slot] = _zoneElapsed;
+                continue;
+            }
+
+            if (_zoneElapsed - _campAnchorTime.GetValueOrDefault(p.Slot) >= Config.AntiCampSeconds)
+            {
+                _campRevealUntil[p.Slot] = Server.CurrentTime + Config.AntiCampRevealSeconds;
+                _campAnchorTime[p.Slot] = _zoneElapsed; // re-arm for repeat offenders
+                Server.PrintToChatAll($" {ChatColors.Gold}[HotPotato]{ChatColors.White} 👁 {ChatColors.Red}{p.PlayerName}{ChatColors.White} is camping and has been revealed!");
+            }
+        }
+    }
+
+    // ---------------- Unified center HUD ----------------
+
+    // Single compositor for all center-screen text so the potato status,
+    // zone warning, and camp reveal never overwrite each other.
+    private void UpdateHud()
+    {
+        if (!_matchActive || !_roundActive)
+            return;
+
+        foreach (var p in GetAliveParticipants())
+        {
+            var lines = new List<string>();
+            bool isHolder = _holder != null && p.Slot == _holder.Slot;
+
+            if (isHolder)
+            {
+                if (_graceRemaining > 0f)
+                {
+                    lines.Add("<font color='#FFD700'>🥔 YOU HAVE THE POTATO</font>");
+                    lines.Add($"<font color='#00FF00'>Grace period: {_graceRemaining:0}s — get ready!</font>");
+                }
+                else
+                {
+                    lines.Add("<font color='#FFD700'>🥔 YOU HAVE THE POTATO</font>");
+                    lines.Add($"<font color='#FF4444'>EXPLODES IN {Math.Max(_fuseRemaining, 0):0}s</font>");
+                    lines.Add("<font color='#CCCCCC'>Pass it: E or knife hit</font>");
+                }
+            }
+
+            if (_outsideZone.Contains(p.Slot))
+                lines.Add($"<font color='#FF3333'>⚠ OUTSIDE THE ZONE: -{Config.SafeZoneDamagePerSecond} HP/s ⚠</font>");
+
+            if (_campRevealUntil.TryGetValue(p.Slot, out float until) && until > Server.CurrentTime)
+                lines.Add("<font color='#FF8800'>👁 CAMPING — POSITION REVEALED</font>");
+
+            if (lines.Count > 0)
+                p.PrintToCenterHtml(string.Join("<br>", lines));
+        }
     }
 
     // ---------------- Helpers ----------------
