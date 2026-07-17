@@ -66,14 +66,13 @@ Starting a match automatically ends warmup, disables respawns, and prevents roun
 | `DisablePlayerDamage` | `true` | Block all PvP damage during games |
 | `RoundsPerMatch` | `5` | Rounds per match |
 | `IntermissionSeconds` | `6` | Scoreboard pause between rounds |
-| `FreezeSeconds` | `8` | Pre-round freeze period where players are locked in spawn |
 | `HolderRadarBlip` | `true` | Force the holder onto everyone's radar |
 | `HolderGlow` | `true` | Through-wall glow outline on the holder |
 | `DeathmatchSpawns` | `true` | Spread players across all spawn points |
 | `SafeZoneEnabled` | `true` | Enable the shrinking zone |
-| `SafeZoneStartRadius` | `0` | Starting radius (`0` = auto-calculated to 2x map size) |
+| `SafeZoneStartRadius` | `0` | Starting radius (`0` = auto from map spawns) |
 | `SafeZoneMinRadius` | `350` | Final radius after shrinking |
-| `SafeZoneShrinkSeconds` | `90` | Shrink time (automatically scales with player count) |
+| `SafeZoneShrinkSeconds` | `90` | Time to shrink from start to min |
 | `SafeZoneDamagePerSecond` | `5` | HP/s damage outside the zone |
 | `SafeZoneBeamSegments` | `24` | Beam ring detail (`0` = no visuals) |
 
